@@ -71,7 +71,14 @@ const unsigned long ATTACK_WINDOW_MS = 30;
 const unsigned long MIDI_UPDATE_INTERVAL = 15;
 
 // --- Calibration detect / capture tuning (velostat) ---
-const int   DETECT_MARGIN       = 20;   // raw counts above rest = "you touched this pad"
+// Percent of full playing range above rest, same definition as TRIGGER_PCT
+// (which this was never updated to match when TRIGGER_PCT was tuned for the
+// same underlying vibration-crosstalk problem during normal play) — a fixed
+// raw-count margin doesn't scale with a pad's actual range, so a hard hit's
+// mechanical bleed-through into a neighboring pad during calibration could
+// swamp a small fixed margin without being a meaningful fraction of that
+// pad's own range.
+const float DETECT_MARGIN_PCT   = 0.12f;
 const unsigned long CAPTURE_WINDOW_MS = 1200; // how long to sample peak once detected
 
 // --- Piezo hit detection (fast path, low latency) ---
@@ -139,8 +146,22 @@ struct Sensor {
 Sensor sensors[MAX_SENSORS];
 
 // --- Calibration FSM ---
+// CalState is the phase (rest/wait/capture); CalSensorType and CalScope are
+// orthogonal axes selecting *what* is being calibrated. Kept as separate
+// enums rather than crossed into one (e.g. CAL_RESTING_PIEZO_SINGLE) since
+// the phase logic is identical for both sensors/all scopes and only a few
+// read/write points inside each phase need to branch on sensor or scope.
 enum CalState { CAL_IDLE, CAL_RESTING, CAL_WAITING_TOUCH, CAL_CAPTURING };
 CalState calState = CAL_IDLE;
+
+enum CalSensorType { CAL_SENSOR_VELOSTAT, CAL_SENSOR_PIEZO };
+enum CalScope       { CAL_SCOPE_ALL, CAL_SCOPE_SINGLE, CAL_SCOPE_SINGLE_COPY_ALL };
+
+CalSensorType calSensorType = CAL_SENSOR_VELOSTAT;
+CalScope      calScope      = CAL_SCOPE_ALL;
+int           calTargetPad  = -1;   // pad requested for SINGLE / SINGLE_COPY_ALL; -1 for ALL
+
+const int PIEZO_CAL_MARGIN = 20;    // added to measured piezo noise floor to get calibrated piezoThreshold
 
 bool calibratedFlag[MAX_SENSORS];
 bool wasAboveDetect[MAX_SENSORS];   // for "already calibrated" one-shot notice
@@ -159,7 +180,8 @@ const unsigned long PRINT_INTERVAL = 150;
 
 void printSettings();
 void onCalibrationTrigger();
-void startCalibration();
+void startCalibration(CalSensorType sensor, CalScope scope, int targetPad);
+void abortCalibration();
 void abortToUniformCalibration();
 
 void setup() {
@@ -207,6 +229,7 @@ void printSettings() {
     Serial.print(" (note "); Serial.print(sensors[i].note); Serial.print(")");
     Serial.print("  rest="); Serial.print(sensors[i].veloRest);
     Serial.print("  max="); Serial.print(sensors[i].veloMax);
+    Serial.print("  piezoThresh="); Serial.print(sensors[i].piezoThreshold);
     Serial.print("  piezoCeil="); Serial.println(sensors[i].piezoAdaptiveMax, 0);
   }
 }
@@ -273,7 +296,40 @@ void handleSerial1() {
     Serial1.println("ACK,SET_XTALK");
 
   } else if (cmd == "CAL_START") {
-    onCalibrationTrigger();
+    int c1 = rest.indexOf(',');
+    String sensorStr = (c1 == -1) ? rest : rest.substring(0, c1);
+    String afterSensor = (c1 == -1) ? "" : rest.substring(c1 + 1);
+
+    CalSensorType sensor;
+    if (sensorStr == "PIEZO") sensor = CAL_SENSOR_PIEZO;
+    else if (sensorStr == "VELOSTAT") sensor = CAL_SENSOR_VELOSTAT;
+    else { Serial1.println("ERR,MALFORMED"); return; }
+
+    int c2 = afterSensor.indexOf(',');
+    String scopeStr = (c2 == -1) ? afterSensor : afterSensor.substring(0, c2);
+    String padStr   = (c2 == -1) ? ""          : afterSensor.substring(c2 + 1);
+
+    CalScope scope;
+    if (scopeStr == "ALL") scope = CAL_SCOPE_ALL;
+    else if (scopeStr == "SINGLE") scope = CAL_SCOPE_SINGLE;
+    else if (scopeStr == "SINGLE_COPY_ALL") scope = CAL_SCOPE_SINGLE_COPY_ALL;
+    else { Serial1.println("ERR,MALFORMED"); return; }
+
+    int padIndex = -1;
+    if (scope != CAL_SCOPE_ALL) {
+      if (padStr.length() == 0) { Serial1.println("ERR,MALFORMED"); return; }
+      padIndex = padStr.toInt();
+      if (padIndex < 0 || padIndex >= NUM_SENSORS) { Serial1.println("ERR,BAD_PAD_INDEX"); return; }
+    }
+
+    if (calState != CAL_IDLE) {
+      if (sensor != calSensorType) { Serial1.println("ERR,CAL_BUSY"); return; }
+      abortCalibration(); // CAL_START for the sensor already running aborts it, same as button/'c'
+      Serial1.println("ACK,CAL_START");
+      return;
+    }
+
+    startCalibration(sensor, scope, padIndex);
     Serial1.println("ACK,CAL_START");
 
   } else if (cmd == "SET_THRESH") {
@@ -361,19 +417,53 @@ void onCurveButtonTrigger() {
   Serial.print("Curve exponent -> "); Serial.println(curveExponent, 2);
 }
 
-// ---- Single entry point for "the button/command was triggered" ----
-void onCalibrationTrigger() {
-  if (calState == CAL_IDLE) {
-    startCalibration();
-  } else {
-    abortToUniformCalibration();
+const char* calSensorName(CalSensorType s) {
+  return (s == CAL_SENSOR_PIEZO) ? "PIEZO" : "VELOSTAT";
+}
+
+void sendCalState(const char* state) {
+  Serial1.print("CAL_STATE,"); Serial1.print(calSensorName(calSensorType)); Serial1.print(","); Serial1.println(state);
+}
+
+void applyVelostatCalToAllPads(int rest, int maxVal) {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sensors[i].veloRest = rest;
+    sensors[i].veloMax = maxVal;
   }
 }
 
-void startCalibration() {
-  Serial.println("=== CALIBRATION STARTED ===");
+void applyPiezoCalToAllPads(int threshold, int ceilingBaseline) {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    sensors[i].piezoThreshold = threshold;
+    sensors[i].piezoCeilingBaseline = ceilingBaseline;
+    sensors[i].piezoAdaptiveMax = (float)ceilingBaseline; // snap immediately, don't wait for decay
+  }
+}
+
+// ---- Single entry point for "the button/command was triggered" ----
+// Legacy physical-button / USB 'c' path — always VELOSTAT + ALL scope,
+// unchanged from before this generalization (see abortCalibration() for
+// why its abort behavior is still safe when a differently-scoped run is
+// active).
+void onCalibrationTrigger() {
+  if (calState == CAL_IDLE) {
+    startCalibration(CAL_SENSOR_VELOSTAT, CAL_SCOPE_ALL, -1);
+  } else {
+    abortCalibration();
+  }
+}
+
+void startCalibration(CalSensorType sensor, CalScope scope, int targetPad) {
+  calSensorType = sensor;
+  calScope = scope;
+  calTargetPad = targetPad;
+
+  Serial.print("=== CALIBRATION STARTED ("); Serial.print(calSensorName(sensor));
+  Serial.print(scope == CAL_SCOPE_ALL ? ", ALL" : (scope == CAL_SCOPE_SINGLE ? ", SINGLE" : ", SINGLE_COPY_ALL"));
+  if (scope != CAL_SCOPE_ALL) { Serial.print(" pad="); Serial.print(targetPad); }
+  Serial.println(") ===");
   Serial.println(">>> Don't touch any pad. Resting for 3 sec...");
-  Serial1.println("CAL_STATE,RESTING");
+  sendCalState("RESTING");
   for (int i = 0; i < NUM_SENSORS; i++) {
     calRestTotal[i] = 0;
     calRestSamples[i] = 0;
@@ -387,46 +477,93 @@ void startCalibration() {
 }
 
 void finishRestPhase() {
+  bool restrictToTarget = (calScope != CAL_SCOPE_ALL);
   for (int i = 0; i < NUM_SENSORS; i++) {
-    sensors[i].veloRest = (calRestSamples[i] > 0) ? (int)(calRestTotal[i] / calRestSamples[i]) : 20;
-    Serial.print("Pad "); Serial.print(i); Serial.print(" rest = "); Serial.println(sensors[i].veloRest);
+    if (restrictToTarget && i != calTargetPad) continue; // SINGLE/SINGLE_COPY_ALL: leave other pads untouched
+
+    int restAvg = (calRestSamples[i] > 0) ? (int)(calRestTotal[i] / calRestSamples[i]) : 20;
+    if (calSensorType == CAL_SENSOR_PIEZO) {
+      sensors[i].piezoThreshold = restAvg + PIEZO_CAL_MARGIN;
+      Serial.print("Pad "); Serial.print(i); Serial.print(" piezo rest -> threshold = "); Serial.println(sensors[i].piezoThreshold);
+    } else {
+      sensors[i].veloRest = restAvg;
+      Serial.print("Pad "); Serial.print(i); Serial.print(" rest = "); Serial.println(sensors[i].veloRest);
+    }
   }
-  Serial.println(">>> Touch ANY pad and press it as hard as you'll ever play.");
-  Serial.println("    (order doesn't matter — I'll figure out which pad it is)");
-  Serial1.println("CAL_STATE,WAITING_TOUCH");
+
+  if (restrictToTarget) {
+    Serial.print(">>> Touch pad "); Serial.print(calTargetPad); Serial.println(" and press it as hard as you'll ever play.");
+  } else {
+    Serial.println(">>> Touch ANY pad and press it as hard as you'll ever play.");
+    Serial.println("    (order doesn't matter — I'll figure out which pad it is)");
+  }
+  sendCalState("WAITING_TOUCH");
   calState = CAL_WAITING_TOUCH;
 }
 
-// Copies one representative calibration to every pad and ends the run early
+// Legacy uncertain-data abort path — used only for ALL-scope runs (the
+// physical button/USB 'c' always uses this scope, and it's an accepted,
+// pre-existing risk for that low-stakes path). Copies one representative
+// pad's calibration to every pad using whatever data is available, even if
+// that data is incomplete (mid-capture) — NOT used for SINGLE or
+// SINGLE_COPY_ALL, see abortCalibration() below for why.
 void abortToUniformCalibration() {
-  int uniformMax;
+  int uniformPeak;
   if (calState == CAL_CAPTURING && activePad >= 0) {
     // Use whatever peak has been seen so far on the pad currently being captured
-    uniformMax = (int)capturePeak;
+    uniformPeak = (int)capturePeak;
   } else if (lastCompletedMax > 0) {
-    uniformMax = lastCompletedMax;
+    uniformPeak = lastCompletedMax;
   } else {
-    uniformMax = 900; // no data yet at all — fall back to a safe default
+    uniformPeak = 900; // no data yet at all — fall back to a safe default
   }
 
-  // Average rest across pads that finished the rest phase (falls back to defaults if aborted super early)
-  long restSum = 0;
-  for (int i = 0; i < NUM_SENSORS; i++) restSum += sensors[i].veloRest;
-  int uniformRest = restSum / NUM_SENSORS;
+  if (calSensorType == CAL_SENSOR_PIEZO) {
+    long threshSum = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) threshSum += sensors[i].piezoThreshold;
+    int uniformThreshold = threshSum / NUM_SENSORS;
 
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    sensors[i].veloRest = uniformRest;
-    sensors[i].veloMax = uniformMax;
+    applyPiezoCalToAllPads(uniformThreshold, uniformPeak);
+
+    Serial.println("=== CALIBRATION ABORTED — applying uniform PIEZO values to ALL pads ===");
+    Serial.print("uniform threshold="); Serial.print(uniformThreshold);
+    Serial.print("  uniform ceiling="); Serial.println(uniformPeak);
+  } else {
+    // Average rest across pads that finished the rest phase (falls back to defaults if aborted super early)
+    long restSum = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) restSum += sensors[i].veloRest;
+    int uniformRest = restSum / NUM_SENSORS;
+
+    applyVelostatCalToAllPads(uniformRest, uniformPeak);
+
+    Serial.println("=== CALIBRATION ABORTED — applying uniform VELOSTAT values to ALL pads ===");
+    Serial.print("uniform rest="); Serial.print(uniformRest);
+    Serial.print("  uniform max="); Serial.println(uniformPeak);
   }
-
-  Serial.println("=== CALIBRATION ABORTED — applying uniform values to ALL pads ===");
-  Serial1.println("CAL_STATE,ABORTED");
-  Serial.print("uniform rest="); Serial.print(uniformRest);
-  Serial.print("  uniform max="); Serial.println(uniformMax);
+  sendCalState("ABORTED");
   printSettings();
 
   calState = CAL_IDLE;
   activePad = -1;
+}
+
+// Single entry point for "abort the active run" — dispatches on scope since
+// SINGLE/SINGLE_COPY_ALL must NEVER apply partial/uncertain data to other
+// pads (we've been burned by exactly this before: an incomplete velostat
+// run once produced max=25-32 vs. a realistic ~900 and nearly went live).
+// SINGLE_COPY_ALL fans out to every pad specifically because it's meant to
+// be a deliberate, confident operation — applying uncertain data on abort
+// would be a worse failure than the legacy ALL-scope fallback below, which
+// stays as an accepted, low-stakes risk for that one specific path.
+void abortCalibration() {
+  if (calScope == CAL_SCOPE_ALL) {
+    abortToUniformCalibration();
+  } else {
+    Serial.println("=== CALIBRATION ABORTED — no data applied ===");
+    sendCalState("ABORTED");
+    calState = CAL_IDLE;
+    activePad = -1;
+  }
 }
 
 void updateCalibration() {
@@ -434,7 +571,8 @@ void updateCalibration() {
 
   if (calState == CAL_RESTING) {
     for (int i = 0; i < NUM_SENSORS; i++) {
-      calRestTotal[i] += analogRead(sensors[i].pin);
+      int pin = (calSensorType == CAL_SENSOR_PIEZO) ? sensors[i].piezoPin : sensors[i].pin;
+      calRestTotal[i] += analogRead(pin);
       calRestSamples[i]++;
     }
     if (now - calRestStart >= CAL_REST_DURATION) {
@@ -445,8 +583,21 @@ void updateCalibration() {
 
   if (calState == CAL_WAITING_TOUCH) {
     for (int i = 0; i < NUM_SENSORS; i++) {
-      int raw = analogRead(sensors[i].pin);
-      bool above = raw > sensors[i].veloRest + DETECT_MARGIN;
+      if (calScope != CAL_SCOPE_ALL && i != calTargetPad) continue; // SINGLE/SINGLE_COPY_ALL: ignore every other pad
+
+      int pin = (calSensorType == CAL_SENSOR_PIEZO) ? sensors[i].piezoPin : sensors[i].pin;
+      int raw = analogRead(pin);
+      int detectThreshold;
+      if (calSensorType == CAL_SENSOR_PIEZO) {
+        // Piezo's detect threshold is its just-measured piezoThreshold (already rest+margin, set in finishRestPhase()).
+        detectThreshold = sensors[i].piezoThreshold;
+      } else {
+        // Percent of full playing range above rest, matching TRIGGER_PCT's definition.
+        float range = (float)(sensors[i].veloMax - sensors[i].veloRest);
+        if (range < 1) range = 1;
+        detectThreshold = sensors[i].veloRest + (int)(range * DETECT_MARGIN_PCT);
+      }
+      bool above = raw > detectThreshold;
 
       if (above && !wasAboveDetect[i]) {
         // Fresh touch onset on pad i
@@ -459,7 +610,7 @@ void updateCalibration() {
           captureStart = now;
           calState = CAL_CAPTURING;
           Serial.print(">>> Detected pad "); Serial.print(i); Serial.println(" — capturing peak, keep pressing...");
-          Serial1.print("CAL_STATE,CAPTURING,"); Serial1.println(i);
+          Serial1.print("CAL_STATE,"); Serial1.print(calSensorName(calSensorType)); Serial1.print(",CAPTURING,"); Serial1.println(i);
           break; // handle one pad at a time
         }
       } else if (!above) {
@@ -470,34 +621,59 @@ void updateCalibration() {
   }
 
   if (calState == CAL_CAPTURING) {
-    int raw = analogRead(sensors[activePad].pin);
+    int pin = (calSensorType == CAL_SENSOR_PIEZO) ? sensors[activePad].piezoPin : sensors[activePad].pin;
+    int raw = analogRead(pin);
     if (raw > capturePeak) capturePeak = raw;
 
     if (now - captureStart >= CAPTURE_WINDOW_MS) {
-      int rest = sensors[activePad].veloRest;
-      sensors[activePad].veloMax = (capturePeak > rest + 20) ? (int)capturePeak : rest + 200;
+      if (calSensorType == CAL_SENSOR_PIEZO) {
+        int rest = sensors[activePad].piezoThreshold;
+        sensors[activePad].piezoCeilingBaseline = (capturePeak > rest + 20) ? (int)capturePeak : rest + 200;
+        sensors[activePad].piezoAdaptiveMax = (float)sensors[activePad].piezoCeilingBaseline; // snap immediately, don't wait for decay
+        lastCompletedMax = sensors[activePad].piezoCeilingBaseline;
+        Serial.print("Pad "); Serial.print(activePad);
+        Serial.print(" piezo calibrated. ceiling="); Serial.println(sensors[activePad].piezoCeilingBaseline);
+      } else {
+        int rest = sensors[activePad].veloRest;
+        sensors[activePad].veloMax = (capturePeak > rest + 20) ? (int)capturePeak : rest + 200;
+        lastCompletedMax = sensors[activePad].veloMax;
+        Serial.print("Pad "); Serial.print(activePad);
+        Serial.print(" calibrated. max="); Serial.println(sensors[activePad].veloMax);
+      }
       calibratedFlag[activePad] = true;
-      lastCompletedMax = sensors[activePad].veloMax;
+      Serial1.print("CAL_STATE,"); Serial1.print(calSensorName(calSensorType)); Serial1.print(",PAD_DONE,"); Serial1.println(activePad);
 
-      Serial.print("Pad "); Serial.print(activePad);
-      Serial.print(" calibrated. max="); Serial.println(sensors[activePad].veloMax);
-      Serial1.print("CAL_STATE,PAD_DONE,"); Serial1.println(activePad);
-
-      int doneCount = 0;
-      for (int i = 0; i < NUM_SENSORS; i++) if (calibratedFlag[i]) doneCount++;
-      Serial.print(doneCount); Serial.print(" of "); Serial.print(NUM_SENSORS); Serial.println(" pads done.");
-
+      int finishedPad = activePad;
       activePad = -1;
       for (int i = 0; i < NUM_SENSORS; i++) wasAboveDetect[i] = false; // require full release before next detect
 
-      if (doneCount >= NUM_SENSORS) {
+      if (calScope == CAL_SCOPE_ALL) {
+        int doneCount = 0;
+        for (int i = 0; i < NUM_SENSORS; i++) if (calibratedFlag[i]) doneCount++;
+        Serial.print(doneCount); Serial.print(" of "); Serial.print(NUM_SENSORS); Serial.println(" pads done.");
+
+        if (doneCount >= NUM_SENSORS) {
+          Serial.println("=== CALIBRATION COMPLETE ===");
+          sendCalState("COMPLETE");
+          printSettings();
+          calState = CAL_IDLE;
+        } else {
+          Serial.println(">>> Touch the next uncalibrated pad.");
+          calState = CAL_WAITING_TOUCH;
+        }
+      } else {
+        // SINGLE / SINGLE_COPY_ALL: exactly one pad is in scope, and it just finished.
+        if (calScope == CAL_SCOPE_SINGLE_COPY_ALL) {
+          if (calSensorType == CAL_SENSOR_PIEZO) {
+            applyPiezoCalToAllPads(sensors[finishedPad].piezoThreshold, sensors[finishedPad].piezoCeilingBaseline);
+          } else {
+            applyVelostatCalToAllPads(sensors[finishedPad].veloRest, sensors[finishedPad].veloMax);
+          }
+        }
         Serial.println("=== CALIBRATION COMPLETE ===");
-        Serial1.println("CAL_STATE,COMPLETE");
+        sendCalState("COMPLETE");
         printSettings();
         calState = CAL_IDLE;
-      } else {
-        Serial.println(">>> Touch the next uncalibrated pad.");
-        calState = CAL_WAITING_TOUCH;
       }
     }
     return;
@@ -658,6 +834,7 @@ void loop() {
           usbMIDI.sendNoteOn(s.note, max(hitVelocity, 1), 1);
           s.lastSentVelocity = hitVelocity;
           s.noteOn = true;
+          s.lastHitTime = now;
           s.touchState = TOUCH_HELD;
           Serial1.print("HIT,"); Serial1.print(i); Serial1.print(","); Serial1.print(hitVelocity); Serial1.println(",V");
           Serial.print("PAD "); Serial.print(i);
