@@ -1,4 +1,4 @@
-# DIVA Drum — Project Guide for Claude Code
+# Jaiba Drum — Project Guide for Claude Code
 
 This file gives context for an ongoing hybrid piezo + velostat MIDI drum trigger
 project, built on a Teensy 4.1. It summarizes the hardware, the reasoning behind
@@ -69,25 +69,26 @@ the planned fix but not yet done as of this writing.
 
 ## Physical pad mapping
 
-**Fill this in once, physically, by hitting each pad and noting which index
-responds** (watch the drum Teensy's own Serial Monitor for
-`"PAD X PIEZO HIT"`, or use the UART `HIT` message once implemented).
-This exists because pad *index* (0–5, used throughout the code and the
-UART protocol) has no inherent connection to a pad's physical location —
-that mapping only exists in your head unless it's written down here.
+Hexagonal drum shell, 7 total mounting positions (3 currently unpopulated —
+room for future pads). Physical numbering was assigned by the user during
+build, not in simple reading order — recorded here from a labeled photo of
+the shell.
 
 | Pad index | Analog pin (piezo) | Analog pin (velostat) | Physical location |
 |---|---|---|---|
-| 0 | A6 | A0 | *(fill in — e.g. "front-left")* |
-| 1 | A7 | A1 | |
-| 2 | A8 | A2 | |
-| 3 | A9 | A3 | |
-| 4 | A10 | A4 | |
-| 5 | A11 | A5 | |
+| 0 | A6 | A0 | Second row, left |
+| 1 | A7 | A1 | Second row, middle |
+| 2 | A8 | A2 | Bottom row, right |
+| 3 | A9 | A3 | Third row, left |
+| 4 | A10 | A4 | Bottom row, left |
+| 5 | A11 | A5 | Third row, right |
 
-Update this table any time pads are physically rewired or repositioned —
-a stale mapping here is worse than no mapping at all, since it looks
-authoritative but silently misleads.
+**Unpopulated slots (reserved for future pads):** top row (both positions),
+and second row, right.
+
+Update this table any time pads are physically rewired, repositioned, or
+new ones are added to the empty slots — a stale mapping here is worse than
+no mapping at all, since it looks authoritative but silently misleads.
 
 ## Key tuning values and why
 

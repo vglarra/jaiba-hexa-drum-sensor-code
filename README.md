@@ -1,4 +1,4 @@
-# DIVA Drum — Hexa Drum Sensor
+# Jaiba Drum — Hexa Drum Sensor
 
 A 6-pad MIDI drum trigger controller built on a Teensy 4.1. Each pad combines two sensors:
 
