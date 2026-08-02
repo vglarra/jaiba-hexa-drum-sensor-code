@@ -66,6 +66,17 @@ float curveExponent = curvePresets[curvePresetIndex];
 const float TRIGGER_PCT = 0.12f;
 const float RELEASE_PCT = 0.02f;
 
+// --- Play mode: restricts which sensor path can trigger a NEW note. Sustain/
+// release/aftertouch stay velostat-owned regardless, once a note is sounding. ---
+enum PlayMode { PLAY_BOTH, PLAY_PIEZO_ONLY, PLAY_VELOSTAT_ONLY };
+PlayMode playMode = PLAY_BOTH;
+
+const char* playModeName(PlayMode m) {
+  if (m == PLAY_PIEZO_ONLY) return "PIEZO_ONLY";
+  if (m == PLAY_VELOSTAT_ONLY) return "VELOSTAT_ONLY";
+  return "BOTH";
+}
+
 // --- Attack capture window (for normal note playing) ---
 const unsigned long ATTACK_WINDOW_MS = 30;
 const unsigned long MIDI_UPDATE_INTERVAL = 15;
@@ -332,6 +343,13 @@ void handleSerial1() {
     startCalibration(sensor, scope, padIndex);
     Serial1.println("ACK,CAL_START");
 
+  } else if (cmd == "SET_PLAY_MODE") {
+    if (rest == "BOTH") playMode = PLAY_BOTH;
+    else if (rest == "PIEZO_ONLY") playMode = PLAY_PIEZO_ONLY;
+    else if (rest == "VELOSTAT_ONLY") playMode = PLAY_VELOSTAT_ONLY;
+    else { Serial1.println("ERR,MALFORMED"); return; }
+    Serial1.println("ACK,SET_PLAY_MODE");
+
   } else if (cmd == "SET_THRESH") {
     int comma = rest.indexOf(',');
     if (comma == -1) { Serial1.println("ERR,MALFORMED"); return; }
@@ -369,6 +387,9 @@ void handleSerial1() {
   } else if (cmd == "GET_XTALK") {
     Serial1.print("XTALKVAL,"); Serial1.print(CROSSTALK_RATIO, 2);
     Serial1.print(","); Serial1.println(CROSSTALK_WINDOW);
+
+  } else if (cmd == "GET_PLAY_MODE") {
+    Serial1.print("PLAY_MODE,"); Serial1.println(playModeName(playMode));
 
   } else {
     Serial1.println("ERR,UNKNOWN_COMMAND");
@@ -792,7 +813,7 @@ void loop() {
     // during a chord) can't be retriggered by small settling vibration —
     // only a fresh hit after release should start a new piezo attack.
     int rawPiezo = analogRead(s.piezoPin);
-    if (!s.hitting && !s.noteOn && rawPiezo > s.piezoThreshold && (now - s.lastHitTime > PIEZO_DEBOUNCE)) {
+    if (!s.hitting && !s.noteOn && playMode != PLAY_VELOSTAT_ONLY && rawPiezo > s.piezoThreshold && (now - s.lastHitTime > PIEZO_DEBOUNCE)) {
       s.hitting = true;
       s.piezoPeak = rawPiezo;
       s.peakTime = now;
@@ -822,7 +843,7 @@ void loop() {
       // No note sounding yet — velostat can still trigger one for touches too
       // soft to excite the piezo (e.g. slow presses with no sharp attack).
       if (s.touchState == TOUCH_IDLE) {
-        if (pct >= TRIGGER_PCT) {
+        if (playMode != PLAY_PIEZO_ONLY && pct >= TRIGGER_PCT) {
           s.touchState = TOUCH_ATTACK;
           s.attackStart = now;
           s.attackPeak = s.smoothed;

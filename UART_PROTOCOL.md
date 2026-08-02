@@ -59,6 +59,17 @@ Response to a `GET_XTALK` query. Reports current `CROSSTALK_RATIO` and
 `CROSSTALK_WINDOW`.
 Example: `XTALKVAL,0.40,5`
 
+### `PLAY_MODE,<mode>`
+Response to a `GET_PLAY_MODE` query. Reports the current play mode —
+`BOTH`, `PIEZO_ONLY`, or `VELOSTAT_ONLY`. Query-only, matching `GET_XTALK`/
+`XTALKVAL`'s pattern — no `ACK` involved (that's only sent for the
+`SET_PLAY_MODE` command below, which actually changes the value). Added
+specifically so the TFT can resync its own display of play mode after a
+reconnect/reboot — relying solely on "the UI remembers its last
+`SET_PLAY_MODE`" breaks the moment there's more than one control surface,
+or the TFT restarts mid-session.
+Example: `PLAY_MODE,VELOSTAT_ONLY`
+
 ### `ACK,<command>`
 Sent after successfully applying any `SET_*` command from the TFT, so the
 UI can confirm a change actually took effect rather than assuming success.
@@ -98,6 +109,15 @@ Example: `SET_CURVE,0.50`
 Set `CROSSTALK_RATIO` and `CROSSTALK_WINDOW` together.
 Example: `SET_XTALK,0.45,5`
 
+### `SET_PLAY_MODE,<mode>`
+Restricts which sensor path can trigger a **new** note, for isolating one
+sensor type while testing/feeling it out. `<mode>` is one of `BOTH`
+(default — either sensor can trigger), `PIEZO_ONLY`, `VELOSTAT_ONLY`.
+Global, not per-pad. Only gates triggering — once a note is sounding (from
+whichever path was allowed to start it), velostat continues to own
+sustain/release/aftertouch exactly as before, regardless of play mode.
+Example: `SET_PLAY_MODE,VELOSTAT_ONLY`
+
 ### `CAL_START,<sensor>,<scope>[,<padIndex>]`
 Starts a calibration run. Replaces the old argument-less `CAL_START`.
 
@@ -134,6 +154,10 @@ Request current values for one pad. Drum Teensy responds with `PADVAL,...`
 Request current crosstalk settings. Drum Teensy responds with
 `XTALKVAL,...` (see above).
 
+### `GET_PLAY_MODE`
+Request the current play mode. Drum Teensy responds with `PLAY_MODE,...`
+(see above).
+
 ---
 
 ## Piezo calibration — new concept, mirrors velostat's shape
@@ -160,27 +184,6 @@ states, rest-phase sampling, and capture-phase peak-tracking all need
 piezo-specific implementations alongside (not replacing) the existing
 velostat ones, since a user may want to calibrate either independently.
 
-### `SET_PLAY_MODE,<mode>`
-**Not yet implemented — queued as the next feature after the current
-`DETECT_MARGIN` fix.** Lets the player restrict which sensor path can
-trigger notes, for isolating one sensor type while testing/feeling it out.
-`<mode>` is one of `BOTH` (default, current behavior — either sensor can
-trigger), `PIEZO_ONLY`, `VELOSTAT_ONLY`. Global, not per-pad.
-
-Implementation sketch (not finalized): gate the piezo fast-path's trigger
-condition and the velostat's `TOUCH_ATTACK` trigger condition each behind
-a check against the current mode — e.g. piezo's `if (!s.hitting && !s.noteOn
-&& ...)` gains `&& playMode != VELOSTAT_ONLY`, and velostat's equivalent
-`TOUCH_IDLE` trigger gains `&& playMode != PIEZO_ONLY`. Sustain/release/
-aftertouch logic (which is velostat-owned regardless of trigger origin)
-likely stays unaffected — worth confirming during implementation whether
-`VELOSTAT_ONLY`/`PIEZO_ONLY` should also suppress aftertouch reporting,
-or just note-triggering.
-
-Fits naturally under a future **Settings** screen (currently a disabled
-placeholder footer icon in `UI_PLAN.md`) rather than Tuning, since it's a
-global play-behavior toggle, not a per-parameter calibration value.
-
 ## Open items — drum sketch changes needed before some commands work
 
 The protocol above assumes some things the drum sketch doesn't do yet:
@@ -203,20 +206,23 @@ The protocol above assumes some things the drum sketch doesn't do yet:
    `updateCalibration()`'s capture-complete block) doesn't currently emit
    anything — these sends need to be added at each relevant transition.
 
-## Suggested implementation order
+## Current status
 
-1. Drum Teensy: add per-pad threshold/ceiling-baseline storage (structural
-   change, do this before wiring up the corresponding commands)
-2. Drum Teensy: add the `Serial1` command parser, implement `SET_NOTE`,
-   `SET_CURVE`, `SET_XTALK`, `CAL_START` first (these don't depend on the
-   per-pad storage change)
-3. Drum Teensy: implement `SET_THRESH`, `SET_CEILING_BASELINE`,
-   `GET_PAD`/`PADVAL` once per-pad storage exists
-4. Drum Teensy: add `CAL_STATE` sends at FSM transitions
-5. Drum Teensy: add `HIT` sends (can reuse/replace the existing test
-   `Serial1.print("PAD,"...)` line in `firePiezoNote()`)
-6. TFT: replace the test protocol's `PAD,<label>` parsing with real
-   parsing for `HIT`, `PADVAL`, `CAL_STATE`, `XTALKVAL`, `ACK`, `ERR`
-7. TFT: wire each screen's stubbed `sendCommand()` calls (from
-   `UI_PLAN.md`'s suggested build order) to actually send the real
-   commands above
+**Drum Teensy: fully implemented and tested.**
+- Per-pad `piezoThreshold`/`piezoCeilingBaseline` storage (on `Sensor`)
+- `Serial1` command parser (`handleSerial1()`) implementing every command
+  above: `SET_NOTE`, `SET_THRESH`, `SET_CEILING_BASELINE`, `SET_CURVE`,
+  `SET_XTALK`, `SET_PLAY_MODE`, `CAL_START`, `GET_PAD`, `GET_XTALK`,
+  `GET_PLAY_MODE`
+- Generalized calibration FSM: sensor type (`PIEZO`/`VELOSTAT`) and scope
+  (`ALL`/`SINGLE`/`SINGLE_COPY_ALL`), with `CAL_STATE` sent at every
+  transition
+- `HIT` sends from both `firePiezoNote()` and the velostat trigger path
+- `SET_PLAY_MODE`/`GET_PLAY_MODE` gating new-note triggering per sensor
+
+**TFT: still outstanding.**
+- Replace the throwaway `PAD,<label>` test-protocol parser with real
+  handling for `HIT`, `PADVAL`, `CAL_STATE`, `XTALKVAL`, `PLAY_MODE`,
+  `ACK`, `ERR`
+- Wire each screen's stubbed `sendCommand()` calls (from `UI_PLAN.md`'s
+  suggested build order) to actually send the real commands above
