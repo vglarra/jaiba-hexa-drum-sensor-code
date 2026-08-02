@@ -30,10 +30,13 @@ retired.
 
 ## Drum Teensy → TFT (events and query responses)
 
-### `HIT,<padIndex>,<velocity>`
+### `HIT,<padIndex>,<velocity>,<source>`
 Sent every time a note fires (from either piezo or velostat path), for the
 future Hit Monitor screen and any live feedback elsewhere in the UI.
-Example: `HIT,4,76`
+`<source>` is `P` (piezo fast-path) or `V` (velostat soft-touch fallback) —
+useful for diagnosing tuning issues, e.g. a pad frequently triggering via
+`V` on normal (not soft) hits suggests its piezo threshold is set too high.
+Examples: `HIT,4,76,P` / `HIT,2,31,V`
 
 ### `PADVAL,<padIndex>,<note>,<threshold>,<ceiling>,<curveExp>`
 Response to a `GET_PAD` query (see below). Reports current live state for
@@ -45,9 +48,9 @@ Example: `PADVAL,4,68,45,823,0.45`
 Sent whenever the calibration FSM changes state, so the Calibration screen
 can mirror it instead of polling or guessing. `<state>` is one of:
 `RESTING`, `WAITING_TOUCH`, `CAPTURING,<padIndex>`, `PAD_DONE,<padIndex>`,
-`COMPLETE`.
+`COMPLETE`, `ABORTED`.
 Examples: `CAL_STATE,RESTING` / `CAL_STATE,CAPTURING,2` /
-`CAL_STATE,PAD_DONE,2` / `CAL_STATE,COMPLETE`
+`CAL_STATE,PAD_DONE,2` / `CAL_STATE,COMPLETE` / `CAL_STATE,ABORTED`
 
 ### `XTALKVAL,<ratio>,<windowMs>`
 Response to a `GET_XTALK` query. Reports current `CROSSTALK_RATIO` and

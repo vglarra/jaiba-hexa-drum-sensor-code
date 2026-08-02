@@ -44,7 +44,6 @@
 
 const int sensorPins[] = { A0, A1, A2, A3, A4, A5 };
 const int piezoPins[]  = { A6, A7, A8, A9, A10, A11 }; // one piezo per pad
-const char* piezoPinNames[] = {"A6", "A7", "A8", "A9", "A10", "A11"};
 const int scaleNotes[] = { 60, 62, 64, 66, 68, 70 }; // C major-ish, C4-A#4
 
 const int NUM_SENSORS = sizeof(sensorPins) / sizeof(sensorPins[0]);
@@ -64,7 +63,7 @@ int curvePresetIndex = 2; // starts at 1.8, matching the old default
 float curveExponent = curvePresets[curvePresetIndex];
 
 // --- Trigger / release thresholds, as % of range above rest ---
-const float TRIGGER_PCT = 0.05f;
+const float TRIGGER_PCT = 0.12f;
 const float RELEASE_PCT = 0.02f;
 
 // --- Attack capture window (for normal note playing) ---
@@ -235,8 +234,7 @@ void handleSerial() {
 }
 
 // Parses commands from the TFT Teensy over Serial1, per UART_PROTOCOL.md.
-// Only SET_NOTE, SET_CURVE, SET_XTALK, and CAL_START are implemented so far
-// (see "Suggested implementation order" in that doc) — the rest come later.
+// Implements every command listed there.
 void handleSerial1() {
   if (!Serial1.available()) return;
   String line = Serial1.readStringUntil('\n');
@@ -312,6 +310,10 @@ void handleSerial1() {
     Serial1.print(","); Serial1.print(s.piezoAdaptiveMax, 0);
     Serial1.print(","); Serial1.println(PIEZO_CURVE_EXP, 2);
 
+  } else if (cmd == "GET_XTALK") {
+    Serial1.print("XTALKVAL,"); Serial1.print(CROSSTALK_RATIO, 2);
+    Serial1.print(","); Serial1.println(CROSSTALK_WINDOW);
+
   } else {
     Serial1.println("ERR,UNKNOWN_COMMAND");
   }
@@ -371,6 +373,7 @@ void onCalibrationTrigger() {
 void startCalibration() {
   Serial.println("=== CALIBRATION STARTED ===");
   Serial.println(">>> Don't touch any pad. Resting for 3 sec...");
+  Serial1.println("CAL_STATE,RESTING");
   for (int i = 0; i < NUM_SENSORS; i++) {
     calRestTotal[i] = 0;
     calRestSamples[i] = 0;
@@ -390,6 +393,7 @@ void finishRestPhase() {
   }
   Serial.println(">>> Touch ANY pad and press it as hard as you'll ever play.");
   Serial.println("    (order doesn't matter — I'll figure out which pad it is)");
+  Serial1.println("CAL_STATE,WAITING_TOUCH");
   calState = CAL_WAITING_TOUCH;
 }
 
@@ -416,6 +420,7 @@ void abortToUniformCalibration() {
   }
 
   Serial.println("=== CALIBRATION ABORTED — applying uniform values to ALL pads ===");
+  Serial1.println("CAL_STATE,ABORTED");
   Serial.print("uniform rest="); Serial.print(uniformRest);
   Serial.print("  uniform max="); Serial.println(uniformMax);
   printSettings();
@@ -454,6 +459,7 @@ void updateCalibration() {
           captureStart = now;
           calState = CAL_CAPTURING;
           Serial.print(">>> Detected pad "); Serial.print(i); Serial.println(" — capturing peak, keep pressing...");
+          Serial1.print("CAL_STATE,CAPTURING,"); Serial1.println(i);
           break; // handle one pad at a time
         }
       } else if (!above) {
@@ -475,6 +481,7 @@ void updateCalibration() {
 
       Serial.print("Pad "); Serial.print(activePad);
       Serial.print(" calibrated. max="); Serial.println(sensors[activePad].veloMax);
+      Serial1.print("CAL_STATE,PAD_DONE,"); Serial1.println(activePad);
 
       int doneCount = 0;
       for (int i = 0; i < NUM_SENSORS; i++) if (calibratedFlag[i]) doneCount++;
@@ -485,6 +492,7 @@ void updateCalibration() {
 
       if (doneCount >= NUM_SENSORS) {
         Serial.println("=== CALIBRATION COMPLETE ===");
+        Serial1.println("CAL_STATE,COMPLETE");
         printSettings();
         calState = CAL_IDLE;
       } else {
@@ -528,7 +536,7 @@ void firePiezoNote(int padIndex, int peak) {
     usbMIDI.sendNoteOn(s.note, hitVelocity, 1);
     s.lastSentVelocity = hitVelocity;
     s.noteOn = true;
-    Serial1.print("PAD,"); Serial1.println(piezoPinNames[padIndex]);
+    Serial1.print("HIT,"); Serial1.print(padIndex); Serial1.print(","); Serial1.print(hitVelocity); Serial1.println(",P");
     Serial.print("PAD "); Serial.print(padIndex);
     Serial.print(" PIEZO HIT  note="); Serial.print(s.note);
     Serial.print("  peak="); Serial.print(peak);
@@ -651,6 +659,7 @@ void loop() {
           s.lastSentVelocity = hitVelocity;
           s.noteOn = true;
           s.touchState = TOUCH_HELD;
+          Serial1.print("HIT,"); Serial1.print(i); Serial1.print(","); Serial1.print(hitVelocity); Serial1.println(",V");
           Serial.print("PAD "); Serial.print(i);
           Serial.print(" VELO TRIGGER  note="); Serial.print(s.note);
           Serial.print("  vel="); Serial.println(hitVelocity);
