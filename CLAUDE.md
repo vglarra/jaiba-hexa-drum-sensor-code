@@ -1,48 +1,24 @@
-# CLAUDE.md
+# DIVA Drum — Project Guide for Claude Code
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file gives context for an ongoing hybrid piezo + velostat MIDI drum trigger
+project, built on a Teensy 4.1. It summarizes the hardware, the reasoning behind
+current tuning values, and the full history of code changes so far — so future
+work (in Claude Code or otherwise) starts from the same understanding.
 
 ## Project overview
 
-DIVA Drum — a 6-pad ("hexa") MIDI drum trigger controller running on a Teensy 4.1. Each pad has two
-sensors working together:
+6-pad MIDI drum controller. Each pad has two sensors working together:
 - **Piezo disc** — fast attack/onset detection (low latency "was it hit, how hard")
-- **Velostat** — continuous pressure sensing (sustain, aftertouch, release, and a soft-touch fallback
-  trigger for hits too gentle to excite the piezo)
+- **Velostat** — continuous pressure sensing (sustain, aftertouch, release, and a
+  soft-touch fallback trigger for hits too gentle to excite the piezo)
 
-Output: MIDI Note On/Off + per-note polyphonic aftertouch, one note per pad (scale notes C4–A#4, MIDI
-channel 1), sent via Teensy's **native USB-MIDI** (`usbMIDI.sendNoteOn/sendNoteOff/sendAfterTouchPoly`).
-This is USB-only output, not dual DIN+USB — the FortySevenEffects `MIDI` library and
-`MIDI_CREATE_DEFAULT_INSTANCE()` have been removed entirely (see Changelog #11 for why).
-
-Everything lives in [src/main.cpp](src/main.cpp) — this is a single-file firmware project.
-
-## Build system
-
-PlatformIO, not the Arduino IDE. The `pio` CLI is not on PATH in this environment — invoke it via its
-full path:
-
-```
-"/c/Users/vlarr/.platformio/penv/Scripts/pio.exe" run                       # build
-"/c/Users/vlarr/.platformio/penv/Scripts/pio.exe" run --target upload       # build + flash
-"/c/Users/vlarr/.platformio/penv/Scripts/pio.exe" device monitor -b 115200  # serial monitor
-```
-
-Environment is `[env:teensy41]` in [platformio.ini](platformio.ini): `platform = teensy`, `board = teensy41`,
-`framework = arduino`.
-
-- `build_flags = -D USB_MIDI_SERIAL` is required — it puts the Teensy's composite USB device into a mode
-  that exposes both a MIDI port and a CDC serial port simultaneously. Without it, `usbMIDI` compiles but
-  no MIDI interface is exposed to the host. Don't reintroduce an external MIDI library — on Teensy, `Serial`
-  is USB-CDC, not a `HardwareSerial`, so `MIDI_CREATE_DEFAULT_INSTANCE()` fails to compile against it.
-- `upload_port = COM4` is pinned explicitly. PlatformIO's auto-reset-to-bootloader can pick the wrong port
-  if a stale COM port from a prior session is cached, or fail with "Access is denied" if something else has
-  the port open — if upload can't auto-reset, press the physical program button on the Teensy 4.1. Update
-  this value if the board enumerates on a different COM port.
-- PlatformIO expects an explicit `#include <Arduino.h>` in `main.cpp` — unlike the Arduino IDE, it does not
-  auto-inject it.
-
-There is no test suite ([test/](test/) only has the PlatformIO scaffold README).
+Output: MIDI Note On/Off + per-note AfterTouch (polyphonic), one note per pad
+(scale notes C4–A#4, MIDI channel 1). **Now sent via Teensy's native USB MIDI**
+(`usbMIDI.sendNoteOn/sendNoteOff/sendAfterTouchPoly`) — switched from DIN MIDI
+for lower latency. The `MIDI` library and `MIDI_CREATE_DEFAULT_INSTANCE()` have
+been removed entirely; this is USB-only, not dual DIN+USB output. Requires
+`build_flags = -D USB_MIDI_SERIAL` in `platformio.ini` so the USB interface
+exposes both a MIDI port and Serial (used for debug prints/calibration).
 
 ## Hardware
 
@@ -50,7 +26,8 @@ There is no test suite ([test/](test/) only has the PlatformIO scaffold README).
 - Resonant frequency: 2.6 ± 0.5 kHz
 - Static capacity: 35000 ± 30% pF
 - Metal plate diameter 35mm, ceramic plate 25mm, total thickness 0.43mm
-- Allowable input: Vp-p max 1.5–30V (rated as actuator; not relevant since used purely as a sensor here)
+- Allowable input: Vp-p max 1.5–30V (rated as actuator; not relevant since used
+  purely as a sensor here)
 - Operating temp: -20°C to 70°C
 
 **Piezo circuit (per pad):**
@@ -67,9 +44,10 @@ Protection (bipolar clamp):
   D1: 1N4148  anode → Ax    , cathode → 3.3V   (clamps positive overvoltage)
   D2: 1N4148  anode → GND   , cathode → Ax     (clamps negative rebound swing)
 ```
-The voltage divider attenuates the piezo's raw output (can spike well above 3.3V on a hard hit) to a safe
-ADC range. Both diodes are needed — piezos produce a bipolar signal (positive on compression, negative on
-release), so a single diode only protects one direction.
+The voltage divider attenuates the piezo's raw output (can spike well above
+3.3V on a hard hit) to a safe ADC range. Both diodes are needed — piezos
+produce a bipolar signal (positive on compression, negative on release), so a
+single diode only protects one direction.
 
 **Velostat circuit (per pad):**
 ```
@@ -77,21 +55,45 @@ release), so a single diode only protects one direction.
 ```
 All pads share common 3.3V and GND rails.
 
-**Current build state:** on a breadboard. This has caused intermittent false triggers (see "Known issues"
-below) — soldering to a perfboard/protoshield is the planned fix but not yet done as of this writing.
+**Current build state:** on a breadboard. This has caused intermittent false
+triggers (see "Known issues" below) — soldering to a perfboard/protoshield is
+the planned fix but not yet done as of this writing.
 
-## Board notes
+## Board / toolchain
 
-- Teensy 4.1, Arduino framework (see Build system above for the USB-MIDI build flag)
-- `analogReadResolution(12)` **must be called explicitly** in `setup()` — Teensy 4.1 defaults to 10-bit
-  `analogRead()` otherwise, which would silently invalidate every threshold in the tuning table below (all
-  tuned against 12-bit counts)
+- Teensy 4.1, Arduino framework
+- `analogReadResolution(12)` — **must be called explicitly**; Teensy 4.1
+  defaults to 10-bit `analogRead()` otherwise, silently invalidating any
+  threshold tuned against 12-bit expectations
+- MIDI library: FortySevenEffects MIDI Library (`#include <MIDI.h>`)
+
+## Physical pad mapping
+
+**Fill this in once, physically, by hitting each pad and noting which index
+responds** (watch the drum Teensy's own Serial Monitor for
+`"PAD X PIEZO HIT"`, or use the UART `HIT` message once implemented).
+This exists because pad *index* (0–5, used throughout the code and the
+UART protocol) has no inherent connection to a pad's physical location —
+that mapping only exists in your head unless it's written down here.
+
+| Pad index | Analog pin (piezo) | Analog pin (velostat) | Physical location |
+|---|---|---|---|
+| 0 | A6 | A0 | *(fill in — e.g. "front-left")* |
+| 1 | A7 | A1 | |
+| 2 | A8 | A2 | |
+| 3 | A9 | A3 | |
+| 4 | A10 | A4 | |
+| 5 | A11 | A5 | |
+
+Update this table any time pads are physically rewired or repositioned —
+a stale mapping here is worse than no mapping at all, since it looks
+authoritative but silently misleads.
 
 ## Key tuning values and why
 
 | Constant | Value | Reasoning |
 |---|---|---|
-| `PIEZO_THRESHOLD` | 45 | Measured resting noise floor was ~3–24 counts (12-bit). Initially set to 30, but one pad (pad1) had a noisier floor (up to 37) due to a loose breadboard/protoboard connection — bumped to 45 for margin. Real soft hits start around 40+, so there's limited headroom; a per-pad calibrated threshold (see "Possible next steps") would let cleaner pads use a lower threshold. Still needed as of this writing — board is on a protoboard, not yet soldered, so it's still noisy; revisit once soldered and pad1's noise floor is re-measured as clean. |
+| `PIEZO_THRESHOLD` | 45 (⚠️ see note) | Measured resting noise floor was ~3–24 counts (12-bit). Initially set to 30, but one pad (pad1) had a noisier floor (up to 37) due to a loose breadboard connection — bumped to 45 for margin. Real soft hits start around 40+, so there's limited headroom; a per-pad calibrated threshold (see "Possible next steps") would let cleaner pads use a lower threshold. **Regression risk:** the USB MIDI migration (done by Claude Code) reintroduced `PIEZO_THRESHOLD = 30` — likely regenerated from an earlier version of the sketch. Should be restored to 45 unless pad1 has since been soldered and its noise floor re-measured as clean. |
 | `PIEZO_MAX` | 800 | Baseline/floor for the adaptive ceiling (see below). Measured hard hits typically land 400–900; rare outliers hit 1000–2600, which now clip to velocity 127 rather than stretching the whole curve. |
 | `PIEZO_PEAK_WINDOW` | 3ms | Time spent sampling after threshold crossing to find the true peak of a hit, before mapping to velocity. This is the main remaining source of intentional latency. |
 | `PIEZO_DEBOUNCE` | 35ms | Minimum gap before the same pad can retrigger; caps single-pad hit rate around ~28/sec. |
@@ -102,123 +104,134 @@ below) — soldering to a perfboard/protoshield is the planned fix but not yet d
 
 ## Diagnostic findings (from real hardware testing)
 
-**Crosstalk is real and mechanical.** Every hard hit bleeds into all 5 other pads within 1–4ms, at roughly
-3–25% of the real hit's peak — vibration traveling through the shared mounting surface/frame, not
-electrical. Real chords, by contrast, land at 50%+ of the loudest simultaneous hit. This separation is what
-the crosstalk filter (0.40 ratio threshold) relies on.
+**Crosstalk is real and mechanical.** Every hard hit bleeds into all 5 other
+pads within 1–4ms, at roughly 3–25% of the real hit's peak — vibration
+traveling through the shared mounting surface/frame, not electrical. Real
+chords, by contrast, land at 50%+ of the loudest simultaneous hit. This
+separation is what the crosstalk filter (0.40 ratio threshold) relies on.
 
-**Pad1 and pad4 showed isolated false triggers** with no other pad elevated at the same time — traced to
-loose/intermittent breadboard connections. Confirmed by the user: wiggling the wire reproduces random
-spikes. A floating analog input picks up ambient EMI/capacitive noise; any wiggle changes contact
-resistance and shows up as a spike.
+**Pad1 and pad4 showed isolated false triggers** with no other pad elevated
+at the same time — traced to loose/intermittent breadboard connections.
+Confirmed by the user: wiggling the wire reproduces random spikes. A floating
+analog input picks up ambient EMI/capacitive noise; any wiggle changes
+contact resistance and shows up as a spike.
 
-## Code architecture
+## Code architecture (current)
 
-Two independent sensing paths feed a shared per-pad state machine, output over `usbMIDI` on channel 1.
-A `Sensor` struct per pad holds both velostat state (rest/max/smoothing/touch-state machine) and piezo
-state (hit detection, adaptive ceiling).
-
-- **Piezo (fast path, `PIEZO_*` constants)**: polled every `loop()` iteration. A hit is detected once a raw
-  reading crosses `PIEZO_THRESHOLD`; the code then samples for `PIEZO_PEAK_WINDOW` ms to capture the true
-  peak before evaluating it (`handleNewHit` → `firePiezoNote`). Guarded so it **cannot retrigger a note
-  that's already sounding** (`!s.noteOn` check) — this was a bug fix (settling vibration during a held
-  chord was otherwise re-crossing the threshold and causing buzzing; see Changelog #7).
-- **Velostat (`veloRest`/`veloMax`/`TouchState` per pad)**: smoothed continuously (`VEL_SMOOTHING`) and
-  used for (a) a slow-attack fallback trigger for touches too soft to excite the piezo (`TOUCH_ATTACK` →
-  `mapToVelocity`), and (b) once a note is on — regardless of which path triggered it — velostat owns
-  **sustain** (polyphonic aftertouch, re-sent only when `mapToVelocity` output changes) and **release**
-  (Note Off when pressure % drops below `RELEASE_PCT`).
-- **Crosstalk filtering (`windowOpen`/`windowMaxPeak`/`CROSSTALK_WINDOW`/`CROSSTALK_RATIO`)**: the first hit
-  within a `CROSSTALK_WINDOW`-ms window fires immediately (no added latency); later hits in the same window
-  only fire if their peak is ≥ `CROSSTALK_RATIO` of the window-opening peak, distinguishing real chords
-  from mechanical bleed-through.
-- **Adaptive velocity ceiling (`piezoAdaptiveMax`, `decayAdaptiveCeilings`)**: each pad's ceiling for
-  mapping peak → velocity 127 rises instantly on a new hardest-ever hit and decays slowly back toward
-  `PIEZO_MAX` (every `ADAPTIVE_DECAY_INTERVAL` ms) if not re-triggered, so one outlier hit doesn't
-  permanently compress that pad's dynamic range.
-- **Calibration (`CalState` FSM: `CAL_IDLE` → `CAL_RESTING` → `CAL_WAITING_TOUCH` → `CAL_CAPTURING`)**:
-  triggered by `calButton` (pin 3) or `'c'` over serial. Rests 3s to sample each pad's baseline, then
-  auto-detects whichever pad is touched next (order-independent) and captures its peak over
-  `CAPTURE_WINDOW_MS`, repeating until all pads are done. A second trigger mid-run aborts and copies a
-  single representative rest/max to every pad (`abortToUniformCalibration`) for a quick uniform cal. This
-  only calibrates the velostat range (`veloRest`/`veloMax`) — it has not yet been extended to per-pad piezo
-  threshold calibration.
-- Curve shaping (`curveExponent`, cycled via `curveButton` pin 4 through `curvePresets`) is a single shared
-  exponent applied to *all* pads' velostat velocity mapping — there's no per-pad curve.
-
-### Serial protocol (115200 baud)
-
-Debug output and a small command interface share the same USB serial port (`handleSerial()`):
-`c` (calibrate), `p` (print settings), `e <num>` (set curve exponent for all pads), `+`/`-` (nudge exponent
-by 0.1). Per-pad raw/percent values print every `PRINT_INTERVAL` ms when idle.
-
-### Gotcha: forward declarations
-
-PlatformIO's ctags-based auto-prototype generator does not reliably insert forward declarations for every
-function in this file — several functions used before their definition need explicit prototypes added
-manually near the top of the file (see the block just before `setup()`). If new functions are added that
-are called before their point of definition, add an explicit prototype rather than assuming it'll be
-auto-generated.
+- `Sensor` struct per pad: holds both velostat state (rest/max/smoothing/
+  touch-state machine) and piezo state (hit detection, adaptive ceiling)
+- Velostat: continuous smoothed reading, trigger/release thresholds as % of
+  calibrated range, owns sustain (aftertouch) and release regardless of
+  whether the note was triggered by piezo or velostat
+- Piezo: fast-path attack detection, guarded so it **cannot retrigger a note
+  that's already sounding** (`!s.noteOn` check) — this was a bug fix, see
+  changelog
+- Crosstalk filter: the first hit in a timing group fires immediately
+  (near-zero added latency); only subsequent hits within `CROSSTALK_WINDOW`
+  are checked against the group's opening peak before being accepted or
+  discarded
+- Adaptive ceiling: per-pad `piezoAdaptiveMax`, rises instantly on a new
+  hardest hit, decays slowly otherwise (see table above)
+- Calibration FSM (velostat only, not yet extended to piezo): button/serial
+  triggered, auto-detects which pad is touched, captures peak over a capture
+  window, supports abort-to-uniform for a quick single-pad-based calibration
+  of all pads
 
 ## Changelog (chronological)
 
-1. **Baseline circuit review** — confirmed piezo divider + bipolar diode clamp (D1 for overvoltage, D2
-   added for negative rebound — original design only had one diode).
+1. **Baseline circuit review** — confirmed piezo divider + bipolar diode
+   clamp (D1 for overvoltage, D2 added for negative rebound — original design
+   only had one diode).
 2. **`analogReadResolution(12)` added** — was defaulting to 10-bit.
-3. **Re-tuned `PIEZO_THRESHOLD`/`PIEZO_MAX`** from real diagnostic sketch readings (rest ~3–24, soft hits
-   ~40–200, hard hits ~400–2600 with rare outliers): 15→30, 500→800.
-4. **Crosstalk discovered and characterized** via timestamped hit-event logging; found consistent ~3–25%
-   bleed-through on every hard hit.
-5. **Buffered crosstalk filter (v1)** — grouped all hits within 5ms, waited for the window to close, then
-   fired only those ≥30% of the window's max. Verified against real chord data; ratio bumped to 40% after
-   finding a 32% crosstalk outlier that would have slipped through at 30%.
-6. **Pad1/pad4 false-trigger root cause found** — isolated noise spikes traced to loose breadboard
-   connections (user confirmed by wiggling wires). `PIEZO_THRESHOLD` raised 30→45 as a partial software
-   mitigation; soldering identified as the real fix (not yet done).
-7. **Chord-hold buzzing bug fixed** — piezo fast-path was retriggering notes during a sustained chord hold
-   due to settling vibration crossing threshold repeatedly. Fixed by gating the piezo trigger on
-   `!s.noteOn`.
-8. **Crosstalk filter rewritten for low latency (v2)** — original v1 added up to ~8ms of latency to *every*
-   hit (3ms peak window + 5ms buffer wait), even solo hits with no crosstalk risk. Rewritten so the first
-   hit in a group fires immediately; only followers within the window are delayed for the ratio check. Cut
-   solo-hit latency to ~3ms (just the peak window).
-9. **Per-pad adaptive velocity ceiling added** — addresses hard hits not consistently reaching velocity 127
-   in the user's sampler software. Each pad's ceiling now rises instantly on a new hardest hit and decays
-   slowly (1.5%/sec) back toward the tuned `PIEZO_MAX` baseline.
-10. **Migrated to VS Code + PlatformIO** for git-based version control. `.ino` renamed to `src/main.cpp`;
-    forward declarations added for functions used before their definition (required under strict C++
+3. **Re-tuned `PIEZO_THRESHOLD`/`PIEZO_MAX`** from real diagnostic sketch
+   readings (rest ~3–24, soft hits ~40–200, hard hits ~400–2600 with rare
+   outliers): 15→30, 500→800.
+4. **Crosstalk discovered and characterized** via timestamped hit-event
+   logging; found consistent ~3–25% bleed-through on every hard hit.
+5. **Buffered crosstalk filter (v1)** — grouped all hits within 5ms, waited
+   for the window to close, then fired only those ≥30% of the window's max.
+   Verified against real chord data; ratio bumped to 40% after finding a 32%
+   crosstalk outlier that would have slipped through at 30%.
+6. **Pad1/pad4 false-trigger root cause found** — isolated noise spikes
+   traced to loose breadboard connections (user confirmed by wiggling wires).
+   `PIEZO_THRESHOLD` raised 30→45 as a partial software mitigation; soldering
+   identified as the real fix (not yet done).
+7. **Chord-hold buzzing bug fixed** — piezo fast-path was retriggering notes
+   during a sustained chord hold due to settling vibration crossing threshold
+   repeatedly. Fixed by gating the piezo trigger on `!s.noteOn`.
+8. **Crosstalk filter rewritten for low latency (v2)** — original v1 added
+   up to ~8ms of latency to *every* hit (3ms peak window + 5ms buffer wait),
+   even solo hits with no crosstalk risk. Rewritten so the first hit in a
+   group fires immediately; only followers within the window are delayed for
+   the ratio check. Cut solo-hit latency to ~3ms (just the peak window).
+9. **Per-pad adaptive velocity ceiling added** — addresses hard hits not
+   consistently reaching velocity 127 in the user's sampler software. Each
+   pad's ceiling now rises instantly on a new hardest hit and decays slowly
+   (1.5%/sec) back toward the tuned `PIEZO_MAX` baseline.
+10. **Migrated to VS Code + PlatformIO** for git-based version control.
+    `.ino` renamed to `src/main.cpp`; forward declarations added for
+    functions used before their definition (required under strict C++
     compilation, unlike the Arduino IDE which auto-generates these).
-11. **Switched from DIN MIDI to Teensy's native USB MIDI** (done in the new PlatformIO project). `MIDI`
-    library and `MIDI_CREATE_DEFAULT_INSTANCE()` removed; all `MIDI.sendX()` calls replaced with
-    `usbMIDI.sendX()`. Aftertouch correctly uses `sendAfterTouchPoly()` (per-note), not channel-wide
-    aftertouch. Requires `build_flags = -D USB_MIDI_SERIAL` in `platformio.ini`. This is USB-only output
-    now, not dual DIN+USB.
-    This migration also reintroduced a regression — `PIEZO_THRESHOLD` came back as `30` instead of the
-    tuned `45`, apparently from an earlier version of the sketch. Fixed back to `45` (item 12).
-12. **`PIEZO_THRESHOLD` regression fixed: 30 → 45.** Confirmed still needed — board is still on a
-    protoboard (not yet soldered), so pad1's noisier floor is still present.
+11. **Switched from DIN MIDI to Teensy's native USB MIDI** (done by Claude
+    Code in the new PlatformIO project). `MIDI` library and
+    `MIDI_CREATE_DEFAULT_INSTANCE()` removed; all `MIDI.sendX()` calls
+    replaced with `usbMIDI.sendX()`. Aftertouch correctly uses
+    `sendAfterTouchPoly()` (per-note), not channel-wide aftertouch. Requires
+    `build_flags = -D USB_MIDI_SERIAL` in `platformio.ini`. This is USB-only
+    output now, not dual DIN+USB.
+    ⚠️ **This migration also reintroduced a regression:** `PIEZO_THRESHOLD`
+    came back as `30` instead of the tuned `45` (see tuning table above) —
+    appears the regenerated file was based on an earlier version of the
+    sketch. Needs to be fixed before relying on this build around pad1,
+    unless soldering has since resolved that pad's noise floor.
+    **Update:** this was fixed — `PIEZO_THRESHOLD` is back to `45` in the
+    current sketch.
+12. **UART link to a second Teensy (TFT UI board) established and tested.**
+    Added `Serial1.begin(115200)` (pins 0=RX1, 1=TX1) and a debug send in
+    `firePiezoNote()`: `Serial1.print("PAD,"); Serial1.println(piezoPinNames[padIndex]);`.
+    Confirmed end-to-end: hitting a physical pad now displays the
+    corresponding analog pin label (e.g. "A6") on the separate TFT project's
+    screen. This is a throwaway test protocol — see the TFT project's
+    `UI_PLAN.md` for the real message protocol still to be designed (will
+    need to carry note/velocity/threshold/calibration data, not just pin
+    labels). Confirms both boards are correctly wired (TX↔RX crossed,
+    shared GND) and that pins 0/1 don't conflict with any existing pin
+    usage in this sketch.
 
 ## Known issues / open items
 
-- **Protoboard wiring is the root cause of pad1/pad4 noise** — not yet soldered/finished. Planned fix:
-  perfboard or protoshield, with strain relief (hot glue/zip-tie anchors near joints) and lightly twisted
-  signal+ground pairs per pad to reduce EMI pickup. `PIEZO_THRESHOLD = 45` is the current mitigation until
-  this is done.
-- **No per-pad piezo threshold calibration yet.** All pads currently share one `PIEZO_THRESHOLD`. Since
-  pad1's noise floor was worse than others due to the loose connection, the shared threshold is tuned
-  conservatively for the worst pad, costing sensitivity on cleaner pads. Worth revisiting *after* soldering
-  — if noise floors converge once wiring is fixed, a shared threshold may remain fine; if they don't, extend
-  the existing velostat calibration FSM to also sample per-pad piezo noise floor.
-- **USB MIDI migration done** (see Changelog #11) — DIN MIDI is no longer wired up in code at all. If a
-  hardware synth ever needs to be fed directly via DIN again, that would need to be re-added alongside
-  `usbMIDI`, not as a replacement for it.
+- **`PIEZO_THRESHOLD` regression from the USB MIDI migration** — fixed, back
+  to `45`.
+- **Breadboard wiring is the root cause of pad1/pad4 noise** — not yet
+  soldered. Planned fix: perfboard or protoshield, with strain relief
+  (hot glue/zip-tie anchors near joints) and lightly twisted signal+ground
+  pairs per pad to reduce EMI pickup.
+- **No per-pad piezo threshold calibration yet.** All pads currently share
+  one `PIEZO_THRESHOLD`. Since pad1's noise floor was worse than others due
+  to the loose connection, the shared threshold is tuned conservatively for
+  the worst pad, costing sensitivity on cleaner pads. Worth revisiting *after*
+  soldering — if noise floors converge once wiring is fixed, a shared
+  threshold may remain fine; if they don't, extend the existing velostat
+  calibration FSM to also sample per-pad piezo noise floor.
+- **USB MIDI migration done** — DIN MIDI is no longer wired up in code at
+  all. If a hardware synth ever needs to be fed directly via DIN again, that
+  would need to be re-added alongside `usbMIDI`, not as a replacement.
+- **UART link to the TFT project is active** — pins 0/1 (Serial1) are now
+  in use for this and should not be repurposed for anything else in this
+  sketch. Current messages sent are a throwaway test format (`PAD,<label>`);
+  the real protocol (carrying note/velocity/threshold/calibration data for
+  the UI) is still to be designed — see the TFT project's `UI_PLAN.md`.
 
 ## Possible next steps (not yet started)
 
-- Solder all pad connections; re-run the raw-noise diagnostic to confirm noise floors drop and converge
-  across pads.
-- Per-pad piezo threshold calibration, extending the existing velostat calibration FSM.
-- Re-evaluate whether `PIEZO_PEAK_WINDOW` (3ms) can be safely reduced for further latency improvement
-  without degrading peak-detection accuracy.
-- If a hardware synth needs direct DIN MIDI input alongside the DAW/USB connection, DIN would need to be
-  re-added (`MIDI` library) running alongside `usbMIDI`, not swapped back in as a replacement.
+- **Fix the `PIEZO_THRESHOLD` regression (30 → 45)** — see "Known issues."
+  Quick fix, do this first.
+- Solder all pad connections; re-run the raw-noise diagnostic to confirm
+  noise floors drop and converge across pads.
+- Per-pad piezo threshold calibration, extending the existing velostat
+  calibration FSM.
+- Re-evaluate whether `PIEZO_PEAK_WINDOW` (3ms) can be safely reduced for
+  further latency improvement without degrading peak-detection accuracy.
+- If a hardware synth needs direct DIN MIDI input alongside the DAW/USB
+  connection, DIN would need to be re-added (`MIDI` library) running
+  alongside `usbMIDI`, not swapped back in as a replacement.

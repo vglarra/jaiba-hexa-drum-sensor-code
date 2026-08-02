@@ -44,6 +44,7 @@
 
 const int sensorPins[] = { A0, A1, A2, A3, A4, A5 };
 const int piezoPins[]  = { A6, A7, A8, A9, A10, A11 }; // one piezo per pad
+const char* piezoPinNames[] = {"A6", "A7", "A8", "A9", "A10", "A11"};
 const int scaleNotes[] = { 60, 62, 64, 66, 68, 70 }; // C major-ish, C4-A#4
 
 const int NUM_SENSORS = sizeof(sensorPins) / sizeof(sensorPins[0]);
@@ -81,7 +82,7 @@ int PIEZO_THRESHOLD = 45;     // raw ADC counts above baseline = "that's a hit"
 int PIEZO_MAX       = 800;    // raw peak that maps to velocity 127
 const unsigned long PIEZO_DEBOUNCE   = 35;  // ms — min gap between hits on the same pad
 const unsigned long PIEZO_PEAK_WINDOW = 3;  // ms — how long to sample the true peak of a hit
-const float PIEZO_CURVE_EXP = 0.45f;        // piezo response curve (separate from velostat's)
+float PIEZO_CURVE_EXP = 0.45f;              // piezo response curve (separate from velostat's)
 
 // --- Adaptive velocity ceiling (per pad) ---
 // PIEZO_MAX above is the starting/floor ceiling. Any hit harder than a
@@ -103,8 +104,8 @@ unsigned long lastAdaptiveDecayTime = 0;
 // if they're >= CROSSTALK_RATIO of the window-opening hit's peak; weaker
 // ones are discarded as mechanical bleed-through. This keeps chords intact
 // while cutting solo-hit latency down to just the peak-finding window.
-const unsigned long CROSSTALK_WINDOW = 5;   // ms
-const float CROSSTALK_RATIO = 0.40f;        // measured chords cleared 50-97%; worst crosstalk was 32%
+unsigned long CROSSTALK_WINDOW = 5;   // ms
+float CROSSTALK_RATIO = 0.40f;        // measured chords cleared 50-97%; worst crosstalk was 32%
 
 bool windowOpen = false;
 unsigned long windowStart = 0;
@@ -132,6 +133,8 @@ struct Sensor {
   unsigned long peakTime;
   unsigned long lastHitTime;
   float piezoAdaptiveMax; // rises instantly on a harder-than-ever hit, decays slowly otherwise
+  int piezoThreshold;         // per-pad copy of PIEZO_THRESHOLD, initialized from it in setup()
+  int piezoCeilingBaseline;   // per-pad copy of PIEZO_MAX, initialized from it in setup()
 };
 
 Sensor sensors[MAX_SENSORS];
@@ -163,6 +166,7 @@ void abortToUniformCalibration();
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 2000);
+  Serial1.begin(115200);
   analogReadResolution(12);
   pinMode(calButton, INPUT_PULLUP);
   pinMode(curveButton, INPUT_PULLUP);
@@ -185,7 +189,9 @@ void setup() {
     sensors[i].piezoPeak = 0;
     sensors[i].peakTime = 0;
     sensors[i].lastHitTime = 0;
-    sensors[i].piezoAdaptiveMax = (float)PIEZO_MAX;
+    sensors[i].piezoThreshold = PIEZO_THRESHOLD;
+    sensors[i].piezoCeilingBaseline = PIEZO_MAX;
+    sensors[i].piezoAdaptiveMax = (float)sensors[i].piezoCeilingBaseline;
   }
 
   Serial.print("=== Velostat scale ("); Serial.print(NUM_SENSORS); Serial.println(" sensors) ===");
@@ -225,6 +231,89 @@ void handleSerial() {
   } else if (line.startsWith("e ")) {
     float v = line.substring(2).toFloat();
     if (v > 0) { curveExponent = v; printSettings(); }
+  }
+}
+
+// Parses commands from the TFT Teensy over Serial1, per UART_PROTOCOL.md.
+// Only SET_NOTE, SET_CURVE, SET_XTALK, and CAL_START are implemented so far
+// (see "Suggested implementation order" in that doc) — the rest come later.
+void handleSerial1() {
+  if (!Serial1.available()) return;
+  String line = Serial1.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  if (line.length() > 63) return; // guard against runaway/garbled lines
+
+  int firstComma = line.indexOf(',');
+  String cmd  = (firstComma == -1) ? line : line.substring(0, firstComma);
+  String rest = (firstComma == -1) ? ""   : line.substring(firstComma + 1);
+
+  if (cmd == "SET_NOTE") {
+    int comma = rest.indexOf(',');
+    if (comma == -1) { Serial1.println("ERR,MALFORMED"); return; }
+    int padIndex = rest.substring(0, comma).toInt();
+    int note = rest.substring(comma + 1).toInt();
+    if (padIndex < 0 || padIndex >= NUM_SENSORS) { Serial1.println("ERR,BAD_PAD_INDEX"); return; }
+    sensors[padIndex].note = note;
+    Serial1.println("ACK,SET_NOTE");
+
+  } else if (cmd == "SET_CURVE") {
+    if (rest.length() == 0) { Serial1.println("ERR,MALFORMED"); return; }
+    float exponent = rest.toFloat();
+    if (exponent <= 0) { Serial1.println("ERR,MALFORMED"); return; }
+    PIEZO_CURVE_EXP = exponent;
+    Serial1.println("ACK,SET_CURVE");
+
+  } else if (cmd == "SET_XTALK") {
+    int comma = rest.indexOf(',');
+    if (comma == -1) { Serial1.println("ERR,MALFORMED"); return; }
+    float ratio = rest.substring(0, comma).toFloat();
+    long windowMs = rest.substring(comma + 1).toInt();
+    if (ratio <= 0 || windowMs <= 0) { Serial1.println("ERR,MALFORMED"); return; }
+    CROSSTALK_RATIO = ratio;
+    CROSSTALK_WINDOW = (unsigned long)windowMs;
+    Serial1.println("ACK,SET_XTALK");
+
+  } else if (cmd == "CAL_START") {
+    onCalibrationTrigger();
+    Serial1.println("ACK,CAL_START");
+
+  } else if (cmd == "SET_THRESH") {
+    int comma = rest.indexOf(',');
+    if (comma == -1) { Serial1.println("ERR,MALFORMED"); return; }
+    int padIndex = rest.substring(0, comma).toInt();
+    int threshold = rest.substring(comma + 1).toInt();
+    if (padIndex < 0 || padIndex >= NUM_SENSORS) { Serial1.println("ERR,BAD_PAD_INDEX"); return; }
+    if (threshold <= 0) { Serial1.println("ERR,MALFORMED"); return; }
+    sensors[padIndex].piezoThreshold = threshold;
+    Serial1.println("ACK,SET_THRESH");
+
+  } else if (cmd == "SET_CEILING_BASELINE") {
+    int comma = rest.indexOf(',');
+    if (comma == -1) { Serial1.println("ERR,MALFORMED"); return; }
+    int padIndex = rest.substring(0, comma).toInt();
+    int baseline = rest.substring(comma + 1).toInt();
+    if (padIndex < 0 || padIndex >= NUM_SENSORS) { Serial1.println("ERR,BAD_PAD_INDEX"); return; }
+    if (baseline <= 0) { Serial1.println("ERR,MALFORMED"); return; }
+    sensors[padIndex].piezoCeilingBaseline = baseline;
+    // Snap the live ceiling to match immediately (both directions) so a
+    // GET_PAD right after this reflects the new value, not a stale one
+    // waiting on the next hard hit (raising) or gradual decay (lowering).
+    sensors[padIndex].piezoAdaptiveMax = (float)baseline;
+    Serial1.println("ACK,SET_CEILING_BASELINE");
+
+  } else if (cmd == "GET_PAD") {
+    int padIndex = rest.toInt();
+    if (padIndex < 0 || padIndex >= NUM_SENSORS) { Serial1.println("ERR,BAD_PAD_INDEX"); return; }
+    Sensor &s = sensors[padIndex];
+    Serial1.print("PADVAL,"); Serial1.print(padIndex);
+    Serial1.print(","); Serial1.print(s.note);
+    Serial1.print(","); Serial1.print(s.piezoThreshold);
+    Serial1.print(","); Serial1.print(s.piezoAdaptiveMax, 0);
+    Serial1.print(","); Serial1.println(PIEZO_CURVE_EXP, 2);
+
+  } else {
+    Serial1.println("ERR,UNKNOWN_COMMAND");
   }
 }
 
@@ -416,10 +505,10 @@ int mapToVelocity(Sensor &s, float pressure) {
   return constrain((int)(mapped * 127), 0, 127);
 }
 
-int getPiezoVelocity(int peak, float ceiling) {
-  if (peak <= PIEZO_THRESHOLD) return 0;
-  float clamped = constrain((float)peak, (float)PIEZO_THRESHOLD, ceiling);
-  float norm = (clamped - PIEZO_THRESHOLD) / (ceiling - PIEZO_THRESHOLD);
+int getPiezoVelocity(int peak, int threshold, float ceiling) {
+  if (peak <= threshold) return 0;
+  float clamped = constrain((float)peak, (float)threshold, ceiling);
+  float norm = (clamped - threshold) / (ceiling - threshold);
   float mapped = pow(norm, PIEZO_CURVE_EXP);
   return constrain((int)(mapped * 127), 1, 127);
 }
@@ -434,11 +523,12 @@ void firePiezoNote(int padIndex, int peak) {
     s.piezoAdaptiveMax = (float)peak;
   }
 
-  int hitVelocity = getPiezoVelocity(peak, s.piezoAdaptiveMax);
+  int hitVelocity = getPiezoVelocity(peak, s.piezoThreshold, s.piezoAdaptiveMax);
   if (hitVelocity >= 3) {
     usbMIDI.sendNoteOn(s.note, hitVelocity, 1);
     s.lastSentVelocity = hitVelocity;
     s.noteOn = true;
+    Serial1.print("PAD,"); Serial1.println(piezoPinNames[padIndex]);
     Serial.print("PAD "); Serial.print(padIndex);
     Serial.print(" PIEZO HIT  note="); Serial.print(s.note);
     Serial.print("  peak="); Serial.print(peak);
@@ -465,7 +555,7 @@ void handleNewHit(int padIndex, int peak) {
     return;
   }
 
-  // Inside an already-open window: only accept if strong enough relative
+  // Inside an a lready-open window: only accept if strong enough relative
   // to the hit that opened it.
   if (peak >= CROSSTALK_RATIO * windowMaxPeak) {
     firePiezoNote(padIndex, peak); // real chord note
@@ -485,12 +575,13 @@ void decayAdaptiveCeilings() {
 
   for (int i = 0; i < NUM_SENSORS; i++) {
     float decayed = sensors[i].piezoAdaptiveMax * ADAPTIVE_DECAY_FACTOR;
-    sensors[i].piezoAdaptiveMax = max((float)PIEZO_MAX, decayed);
+    sensors[i].piezoAdaptiveMax = max((float)sensors[i].piezoCeilingBaseline, decayed);
   }
 }
 
 void loop() {
   handleSerial();
+  handleSerial1();
 
   if (calButtonPressedEdge()) {
     onCalibrationTrigger();
@@ -517,7 +608,7 @@ void loop() {
     // during a chord) can't be retriggered by small settling vibration —
     // only a fresh hit after release should start a new piezo attack.
     int rawPiezo = analogRead(s.piezoPin);
-    if (!s.hitting && !s.noteOn && rawPiezo > PIEZO_THRESHOLD && (now - s.lastHitTime > PIEZO_DEBOUNCE)) {
+    if (!s.hitting && !s.noteOn && rawPiezo > s.piezoThreshold && (now - s.lastHitTime > PIEZO_DEBOUNCE)) {
       s.hitting = true;
       s.piezoPeak = rawPiezo;
       s.peakTime = now;
