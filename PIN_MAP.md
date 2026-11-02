@@ -430,3 +430,68 @@ still a physical decision. An empty kit with this mapping already exists at
 - Do not renumber the existing MIDI notes without asking.
 - Do not add `delay()` or blocking mux settling to the percussive scan.
 - Do not assume the old pad-index → drum-zone order still holds.
+
+---
+
+## 15. Loop pads — backlog (for later)
+
+**Status:** hardware spec is fixed in §6; firmware and MIDI surface are not
+implemented. Pins 5–8 and 24 stay reserved, and the left build currently
+exposes only the 7 dual-layer pads. This is the single checklist to pick the
+work up from.
+
+### Hardware (when the loops are wired)
+
+- 5 velostat-only cells, 2-pin connectors: `1 = 3V3_L`, `2 = VELO`, 100R
+  pulldown. No piezo, so no velocity and no piezo aftertouch.
+- `W_LOOPn_VELO` → mux `W_MUX_Cn` (C0–C4). EN tied to GND at the module;
+  VCC from `3V3_L`; S0–S3 = Teensy pins 5–8; SIG = pin 24 (A10).
+
+### Firmware
+
+- [ ] `LoopSensor` array kept **separate from `sensors[]`** — a loop has no
+      `piezoPin`, and every pad path assumes one.
+- [ ] Mux select helper: `S3..S0 = binary channel`; settle ≥ 10 µs with
+      `micros()` before `analogRead(SIG)`.
+- [ ] Round-robin one channel per 10–20 ms tick, outside the percussive scan;
+      no `delay()` anywhere in the scan.
+- [ ] Smoothing + per-loop rest/trigger/release values. No velocity; decide
+      between on/off and continuous pressure output.
+- [ ] Keep loops out of the existing calibration FSM (§10.6), or add a
+      separate loop calibration step and say so here.
+- [ ] Decide the MIDI surface **before** writing the send code: CC (numbers
+      TBD) or notes 91–95 for the sampler's 5 global pads. Do not invent
+      numbers in firmware until the worksheet in §11 is filled.
+- [ ] Define loop UART messages if the TFT needs them. The current
+      `HIT`/`PADVAL`/`CAL_STATE` set only covers kit pads.
+- [ ] If EEPROM calibration persistence is added later, tag loop calibration
+      with the hemisphere as well.
+- [ ] Keep `NUM_SENSORS`/`MAX_SENSORS` for the dual-layer kit pads and give
+      loops their own `NUM_LOOPS = 5`; do not grow `sensors[]`.
+
+### Sampler side
+
+- The app already has exactly 5 global loop pads
+  (`PadManager::kNumGlobalPads = 5`), disabled by default (`midiNote=-1`).
+- If loops send notes 91–95, map one note per global pad 1:1 — no sampler
+  code change beyond the mapping.
+- If loops send CC, the sampler's global pads are note-triggered today, so a
+  CC handler (or a CC→note bridge) is a small new feature.
+- Global pads live in `.gjm` sessions, not in a standalone `.jai` kit.
+
+### Bench when implemented
+
+- [ ] Press one loop at a time: only the selected mux channel moves, and all
+      five refresh within ~100 ms.
+- [ ] The 7 dual-layer pads show no phantom hits while the mux is scanning.
+- [ ] Five minutes of loop use: no stuck loops, no channel bleed.
+- [ ] Check the UART stream (if used) and the sampler's global pads
+      independently from the kit pads.
+
+### Open decisions
+
+1. CC numbers vs notes 91–95 (and whether a loop outputs pressure/CC
+   continuously or just on/off).
+2. Loop calibration inside the existing FSM or as a separate pass.
+3. UART message shape for loop state, if the TFT will show it.
+4. Whether loop calibration needs EEPROM persistence alongside the pads.
