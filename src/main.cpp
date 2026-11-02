@@ -5,8 +5,18 @@
 // interface exposes both a MIDI port and Serial (used below for debug prints).
 
 // ============================================================
-// VELOSTAT SCALE — AUTO-DETECT CALIBRATION, 6 SENSORS
+// JAIBA DRUM SENSOR — PER-HEMISPHERE BUILD (Teensy 4.1)
+// VELOSTAT SCALE — AUTO-DETECT CALIBRATION
 // + PIEZO CROSSTALK FILTERING (v2)
+//
+// One Teensy per hemisphere, each its own USB-MIDI device:
+//   right — U_R: 9 dual-layer pads, all 18 analog pins  -> pio run -e right
+//   left  — U_L: 7 dual-layer pads                     -> pio run -e left
+//           (the 5 mux'd loop pads are not implemented yet)
+//
+// Pin map: see PIN_MAP.md. The PCB is the source of truth, and pad index is
+// the *connector order* on the board (J_R0..J_R8), not drum pitch. Never map
+// a pad to pins 28-37: they are not analog on a Teensy 4.1.
 //
 // CHANGELOG from previous version:
 //   - analogReadResolution(12) added (was defaulting to 10-bit)
@@ -31,9 +41,15 @@
 //   press again (mid-run)  -> ABORTS and copies the last captured
 //                              max to every pad (quick uniform cal)
 //
-// Wiring per pad (3.3V logic):
-//   3.3V -- velostat -- analog pin --+-- 100ohm -- GND
-// All pads share the same 3.3V and GND rails.
+// Wiring per pad (3.3V logic), as built on the control board:
+//   3V3 -- velostat -- VELO --+-- 100ohm -- GND      (VELO rises with pressure)
+//                             +-- Teensy velostat pin
+//   PSIG -- 10k -- GND, 10k -- PRAW, 1N4148 to 3V3     (bipolar transient)
+// PSIG swings both ways around 0V, so piezo hits are detected as a positive
+// peak only — do not average it into a velocity, and treat 0 as "no swing".
+//
+// All pads share the hemisphere's 3.3V and GND rails. The two hemispheres
+// have separate regulators; calibrate each board on its own.
 //
 // Serial Monitor commands (115200 baud):
 //   c        -> same as pressing the button
@@ -42,12 +58,93 @@
 //   p        -> print current settings
 // ============================================================
 
-const int sensorPins[] = { A0, A1, A2, A3, A4, A5 };
-const int piezoPins[]  = { A6, A7, A8, A9, A10, A11 }; // one piezo per pad
-const int scaleNotes[] = { 60, 62, 64, 66, 68, 70 }; // C major-ish, C4-A#4
+// ============================================================
+// USB IDENTITY — one stable product string per hemisphere
+// ------------------------------------------------------------
+// The Teensy core declares weak usb_string_* symbols (usb_names.h). Defining
+// these strong descriptors renames the USB-MIDI device from the stock
+// "Teensy MIDI" to a fixed per-hemisphere name. The sampler auto-detects the
+// two boards by these names, so they must stay stable:
+//   right -> "Jaiba Right"   left -> "Jaiba Left"
+// This is what makes the USB side survive unplug/replug and host reboots:
+// there is no port id to remember, only the name.
+// ============================================================
+#include <usb_names.h>
+
+#if defined(JAIBA_HEMI_R)
+  #define JAIBA_USB_PRODUCT     {'J','a','i','b','a',' ','R','i','g','h','t'}
+  #define JAIBA_USB_PRODUCT_LEN 11
+#else
+  #define JAIBA_USB_PRODUCT     {'J','a','i','b','a',' ','L','e','f','t'}
+  #define JAIBA_USB_PRODUCT_LEN 10
+#endif
+
+extern "C" {
+struct usb_string_descriptor_struct usb_string_manufacturer_name = {
+    2 + 5 * 2, 3, {'J','a','i','b','a'}
+};
+struct usb_string_descriptor_struct usb_string_product_name = {
+    2 + JAIBA_USB_PRODUCT_LEN * 2, 3, JAIBA_USB_PRODUCT
+};
+}
+
+// ============================================================
+// HEMISPHERE SELECTION — PIN_MAP.md is the authority for these arrays.
+// The build flag comes from platformio.ini; a bare pio build without a
+// hemisphere must fail loudly rather than fall back to the old breadboard
+// pin order (the same physical pin means something different on the PCB).
+// ============================================================
+#if defined(JAIBA_HEMI_R) && defined(JAIBA_HEMI_L)
+#error "Define only one hemisphere flag: JAIBA_HEMI_R or JAIBA_HEMI_L."
+
+#elif defined(JAIBA_HEMI_R)
+// RIGHT — U_R, 9 dual-layer pads. Index == connector order J_R0..J_R8,
+// which is column A rows 1-7 followed by column B row 1. All 18 analog
+// pins are used, no spare.
+const char* const HEMI_NAME         = "RIGHT";
+const char* const CONNECTOR_PREFIX  = "J_R";
+const int sensorPins[] = { 23, 22, 21, 20, 19, 18, 17, 24, 25 }; // A9  A8  A7  A6  A5  A4  A3  A10 A11
+const int piezoPins[]  = { 16, 15, 14, 41, 40, 39, 38, 26, 27 }; // A2  A1  A0  A17 A16 A15 A14 A12 A13
+const char* const sensorPinNames[] = { "A9", "A8", "A7", "A6", "A5", "A4", "A3", "A10", "A11" };
+const char* const piezoPinNames[]  = { "A2", "A1", "A0", "A17", "A16", "A15", "A14", "A12", "A13" };
+// MIDI notes, one per connector index: C4 upward. The first six keep the
+// original 60..70; 72/74/76 cover the three new right-board pads at their
+// connector positions. Pad index follows the PCB connector order, not drum
+// pitch — re-check this table if the pad-to-connector wiring changes.
+const int scaleNotes[] = { 60, 62, 64, 66, 68, 70, 72, 74, 76 };
+
+#elif defined(JAIBA_HEMI_L)
+// LEFT — U_L, 7 dual-layer pads (column B rows 2-8). Index == connector
+// order J_L0..J_L6. Range 78..90 is deliberately disjoint from the right
+// board's 60..76 so the sampler can merge both MIDI streams into one map.
+// NOTE: the 5 mux'd loop pads (CD74HC4067 on pins 5-8 + SIG 24) are NOT
+// implemented yet; those pins stay reserved. See PIN_MAP.md section 6.
+const char* const HEMI_NAME         = "LEFT";
+const char* const CONNECTOR_PREFIX  = "J_L";
+const int sensorPins[] = { 23, 22, 21, 20, 19, 18, 17 }; // A9  A8  A7  A6  A5  A4  A3
+const int piezoPins[]  = { 16, 15, 14, 41, 40, 39, 38 }; // A2  A1  A0  A17 A16 A15 A14
+const char* const sensorPinNames[] = { "A9", "A8", "A7", "A6", "A5", "A4", "A3" };
+const char* const piezoPinNames[]  = { "A2", "A1", "A0", "A17", "A16", "A15", "A14" };
+const int scaleNotes[] = { 78, 80, 82, 84, 86, 88, 90 };
+
+#else
+#error "No hemisphere selected: build with 'pio run -e right' or '-e left'."
+#endif
 
 const int NUM_SENSORS = sizeof(sensorPins) / sizeof(sensorPins[0]);
 const int MAX_SENSORS = 16; // static allocation ceiling, raise if needed
+
+static_assert(sizeof(sensorPins) == sizeof(piezoPins), "one piezo pin per pad");
+static_assert(sizeof(scaleNotes) / sizeof(scaleNotes[0]) ==
+              sizeof(sensorPins) / sizeof(sensorPins[0]),
+              "one note per pad");
+static_assert(sizeof(sensorPinNames) / sizeof(sensorPinNames[0]) ==
+              sizeof(sensorPins) / sizeof(sensorPins[0]),
+              "one velostat pin name per pad");
+static_assert(sizeof(piezoPinNames) / sizeof(piezoPinNames[0]) ==
+              sizeof(piezoPins) / sizeof(piezoPins[0]),
+              "one piezo pin name per pad");
+static_assert(NUM_SENSORS <= MAX_SENSORS, "raise MAX_SENSORS");
 
 const int calButton   = 3;
 const int curveButton = 4;   // press to cycle through curve presets
@@ -93,6 +190,12 @@ const float DETECT_MARGIN_PCT   = 0.12f;
 const unsigned long CAPTURE_WINDOW_MS = 1200; // how long to sample peak once detected
 
 // --- Piezo hit detection (fast path, low latency) ---
+// ADC layout: on the right board the piezo pins are ADC1 for pads 0-5
+// (A2 A1 A0 A17 A16 A15) and ADC2 for pads 6-8 (A14 A12 A13); every velostat
+// pin is ADC1. Reading pads in connector order crosses the ADC boundary only
+// twice per sweep, which is why that order is kept here. If piezo peaks look
+// noisy, group ADC1/ADC2 reads rather than ping-ponging between units.
+//
 // Re-tuned from real 12-bit readings (rest ~3-24, soft hits ~40-200,
 // hard hits ~400-900, rare outliers up to ~2600 which now clip to 127).
 int PIEZO_THRESHOLD = 45;     // raw ADC counts above baseline = "that's a hit"
@@ -190,6 +293,7 @@ unsigned long lastPrint = 0;
 const unsigned long PRINT_INTERVAL = 150;
 
 void printSettings();
+void printPinMap();
 void onCalibrationTrigger();
 void startCalibration(CalSensorType sensor, CalScope scope, int targetPad);
 void abortCalibration();
@@ -226,11 +330,27 @@ void setup() {
     sensors[i].piezoAdaptiveMax = (float)sensors[i].piezoCeilingBaseline;
   }
 
-  Serial.print("=== Velostat scale ("); Serial.print(NUM_SENSORS); Serial.println(" sensors) ===");
+  Serial.print("=== Jaiba drum — "); Serial.print(HEMI_NAME);
+  Serial.print(" hemisphere, "); Serial.print(NUM_SENSORS); Serial.println(" pads ===");
+  printPinMap();
   Serial.println("Commands: c=calibrate  e <num>=set exponent  +/-=nudge  p=print");
   Serial.println("Buttons: calButton=calibrate  curveButton=cycle curve preset");
   Serial.println("------------------------------------");
   printSettings();
+}
+
+// Connector -> analog pins -> note, printed once at boot. This is the table
+// to hold against the PCB while checking the new wiring: touching J_R<n>
+// must move exactly pad <n>'s velostat (velo) reading, and tapping it must
+// move that pad's piezo reading. Pad index == connector order, not pitch.
+void printPinMap() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.print("  ");
+    Serial.print(CONNECTOR_PREFIX); Serial.print(i);
+    Serial.print("  velo "); Serial.print(sensorPinNames[i]);
+    Serial.print("  piezo "); Serial.print(piezoPinNames[i]);
+    Serial.print("  note "); Serial.println(sensors[i].note);
+  }
 }
 
 void printSettings() {
@@ -884,7 +1004,9 @@ void loop() {
 
     if (doPrint) {
       Serial.print("pad"); Serial.print(i);
-      Serial.print(" raw="); Serial.print(raw);
+      Serial.print("("); Serial.print(sensorPinNames[i]); Serial.print("/"); Serial.print(piezoPinNames[i]); Serial.print(")");
+      Serial.print(" velo="); Serial.print(raw);
+      Serial.print(" piezo="); Serial.print(rawPiezo);
       Serial.print(" pct="); Serial.print(pct * 100, 0);
       Serial.print("%  ");
     }

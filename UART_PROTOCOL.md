@@ -6,14 +6,22 @@ single source of truth.
 
 ## Transport
 
-- `Serial1`, 115200 baud, both boards
-- Pins 0 (RX1) / 1 (TX1) on both, wired crossed (TX↔RX), shared GND
+- `Serial1`, 115200 baud on the **sensor** side of both links
+- Sensor side: pins 0 (RX1) / 1 (TX1) on both U_R and U_L, wired crossed
+  (TX↔RX), shared GND
+- UI side (U_UI): the right stream arrives on `Serial1` (pins 0/1), the left
+  stream on `Serial3` (pins 15 RX3 / 14 TX3). The left sensor's UART does
+  **not** move to Serial3 — the PCB copper runs from U_L pins 0/1.
 - One message per line, newline (`\n`) terminated. `println()` on Arduino/
   Teensy sends `\r\n` — receivers should `trim()` incoming lines to drop
   the trailing `\r` (already proven working in the test protocol).
 - Max line length: keep messages well under 64 chars. Receivers should
   discard/reset on any line exceeding a sane limit (the test code already
   does this at 63 chars — keep that guard).
+- **Two independent streams.** U_R and U_L both send on their own Serial1,
+  and pad indices overlap (both start at 0). The UI must key every message
+  by which serial port it arrived on; pad 3 on the right is not pad 3 on
+  the left.
 
 ## General message shape
 
@@ -22,9 +30,9 @@ single source of truth.
 ```
 
 All-caps command name, comma-separated arguments, no spaces. Pad indices
-are always the 0-based index (0–5 currently, matching `sensors[]`), not
-the analog pin label — the pin-label format from the test protocol is
-retired.
+are always the 0-based index within that hemisphere's `sensors[]` — 0–8 on
+the right, 0–6 on the left — not the analog pin label, and not a drum pitch.
+The pin-label format from the test protocol is retired.
 
 ---
 
@@ -208,7 +216,17 @@ The protocol above assumes some things the drum sketch doesn't do yet:
 
 ## Current status
 
-**Drum Teensy: fully implemented and tested.**
+**Drum Teensy: two builds, one per hemisphere (`-D JAIBA_HEMI_R` / `_L`).**
+The protocol itself is unchanged; only the pad-index range and the UI-side
+port differ (see Transport).
+- Right build (`pio run -e right`): 9 pads, implemented. Pad indices 0–8 =
+  connector order J_R0…J_R8, MIDI notes 60–76.
+- Left build (`pio run -e left`): 7 dual-layer pads, implemented. Pad indices
+  0–6 = J_L0…J_L6, MIDI notes 78–90. The 5 mux'd loop pads are **not
+  implemented yet**; pins 5–8 and 24 stay reserved.
+- Both builds present a fixed USB name (`Jaiba Right` / `Jaiba Left`), so the
+  sampler can open both ports at once and merge the disjoint note ranges.
+  This is the direct-USB path; the UART streams above are for the TFT UI.
 - Per-pad `piezoThreshold`/`piezoCeilingBaseline` storage (on `Sensor`)
 - `Serial1` command parser (`handleSerial1()`) implementing every command
   above: `SET_NOTE`, `SET_THRESH`, `SET_CEILING_BASELINE`, `SET_CURVE`,

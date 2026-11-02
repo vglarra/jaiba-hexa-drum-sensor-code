@@ -55,9 +55,12 @@ single diode only protects one direction.
 ```
 All pads share common 3.3V and GND rails.
 
-**Current build state:** on a breadboard. This has caused intermittent false
-triggers (see "Known issues" below) — soldering to a perfboard/protoshield is
-the planned fix but not yet done as of this writing.
+**Current build state (2026-11-02):** two Teensy 4.1 control-board halves, not
+the breadboard. `PIN_MAP.md` is the pin/note authority. Two PlatformIO envs:
+`-e right` (9 pads) and `-e left` (7 pads; mux'd loop pads still pending).
+Each presents a fixed USB-MIDI name (`Jaiba Right` / `Jaiba Left`) and they
+send disjoint notes (60–76 / 78–90) so the sampler can open both ports and
+merge them. The breadboard text below is historical.
 
 ## Board / toolchain
 
@@ -65,9 +68,18 @@ the planned fix but not yet done as of this writing.
 - `analogReadResolution(12)` — **must be called explicitly**; Teensy 4.1
   defaults to 10-bit `analogRead()` otherwise, silently invalidating any
   threshold tuned against 12-bit expectations
-- MIDI library: FortySevenEffects MIDI Library (`#include <MIDI.h>`)
+- Output is native USB-MIDI (`usbMIDI`); no MIDI library is linked
 
 ## Physical pad mapping
+
+> **The PCB build supersedes the table below.** As of the two-Teensy control
+> board (snapshot 2026-11-02), the pad→pin map lives in `PIN_MAP.md`, and a
+> pad index means **PCB connector order** (`J_R0…J_R8` on the right,
+> `J_L0…J_L6` + loop pads on the left) — not the breadboard numbering. The
+> table below is the retired single-Teensy breadboard build; do not wire,
+> calibrate, or tune against it.
+
+### Old breadboard build (single Teensy, retired)
 
 Hexagonal drum shell, 7 total mounting positions (3 currently unpopulated —
 room for future pads). Physical numbering was assigned by the user during
